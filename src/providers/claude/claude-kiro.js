@@ -24,6 +24,7 @@ const KIRO_THINKING = {
     MIN_BUDGET_TOKENS: 1024,
     MAX_BUDGET_TOKENS: 24576,
     DEFAULT_BUDGET_TOKENS: 20000,
+    DEFAULT_REQUEST_BUDGET_TOKENS: 4000,
     START_TAG: '<thinking>',
     END_TAG: '</thinking>',
     MODE_TAG: '<thinking_mode>',
@@ -31,18 +32,39 @@ const KIRO_THINKING = {
     EFFORT_TAG: '<thinking_effort>',
 };
 
+const KIRO_EMPTY_PLACEHOLDER = '(empty placeholder)';
+
+const KIRO_DEFAULT_THINKING_INSTRUCTION = `Think in English for better reasoning quality.
+
+Your thinking process should be thorough and systematic:
+- First, make sure you fully understand what is being asked
+- Consider multiple approaches or perspectives when relevant
+- Think about edge cases, potential issues, and what could go wrong
+- Challenge your initial assumptions
+- Verify your reasoning before reaching a conclusion
+
+After completing your thinking, respond in the same language the user is using in their messages, or in the language specified in their settings if available.
+
+Take the time you need. Quality of thought matters more than speed.`;
+
 const KIRO_CONSTANTS = {
     REFRESH_URL: 'https://prod.{{region}}.auth.desktop.kiro.dev/refreshToken',
     REFRESH_IDC_URL: 'https://oidc.{{region}}.amazonaws.com/token',
-    BASE_URL: 'https://q.{{region}}.amazonaws.com/generateAssistantResponse',
-    BASE_RUNTIME_URL: 'https://q.{{region}}.amazonaws.com/generateAssistantResponse',
+    BASE_URL: 'https://runtime.{{region}}.kiro.dev',
+    BASE_RUNTIME_URL: 'https://runtime.{{region}}.kiro.dev',
     DEFAULT_MODEL_NAME: 'claude-sonnet-4-5',
     AXIOS_TIMEOUT: 120000, // 2 minutes timeout for normal requests
     TOKEN_REFRESH_TIMEOUT: 15000, // 15 seconds timeout for token refresh (shorter to avoid blocking)
     USER_AGENT: 'KiroIDE',
-    KIRO_VERSION: '0.11.63', //升级到新版本会导致aws用不了，需要找新接口
-    CONTENT_TYPE_JSON: 'application/json',
-    ACCEPT_JSON: 'application/json',
+    KIRO_VERSION: '0.7.45', //升级到新版本会导致aws用不了，需要找新接口
+    AWS_SDK_JS_VERSION: '1.0.27',
+    USER_AGENT_OS: 'win32#10.0.19044',
+    USER_AGENT_NODE_VERSION: '22.21.1',
+    GENERATE_ASSISTANT_TARGET: 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse',
+    CONTENT_TYPE_JSON: 'application/x-amz-json-1.0',
+    REFRESH_CONTENT_TYPE_JSON: 'application/json',
+    ACCEPT_JSON: '*/*',
+    ACCEPT_ENCODING: 'gzip, deflate',
     AUTH_METHOD_SOCIAL: 'social',
     CHAT_TRIGGER_TYPE_MANUAL: 'MANUAL',
     ORIGIN_AI_EDITOR: 'AI_EDITOR',
@@ -70,7 +92,7 @@ function buildKiroToolNameMaps(tools) {
 
     if (Array.isArray(tools)) {
         for (const tool of tools) {
-            const originalName = tool?.name;
+            const originalName = getKiroToolName(tool);
             if (!originalName) continue;
             const aliasName = shortenKiroToolName(originalName);
             originalToAlias.set(originalName, aliasName);
@@ -85,6 +107,18 @@ function buildKiroToolNameMaps(tools) {
         toKiroName: (name) => originalToAlias.get(name) || shortenKiroToolName(name),
         fromKiroName: (name) => aliasToOriginal.get(name) || name
     };
+}
+
+function getKiroToolName(tool) {
+    return tool?.name || tool?.function?.name || '';
+}
+
+function getKiroToolDescription(tool) {
+    return tool?.description || tool?.function?.description || '';
+}
+
+function getKiroToolInputSchema(tool) {
+    return tool?.input_schema || tool?.function?.parameters || {};
 }
 
 function restoreKiroToolCallNames(toolCalls, toolNameMaps) {
@@ -257,6 +291,90 @@ function getSystemRuntimeInfo() {
         osName,
         nodeVersion
     };
+}
+
+function getKiroRuntimeMachineId(service) {
+    return generateMachineIdFromConfig({
+        uuid: service.uuid,
+        profileArn: service.profileArn,
+        clientId: service.clientId
+    });
+}
+
+function buildKiroUserAgent(machineId) {
+    return `aws-sdk-js/${KIRO_CONSTANTS.AWS_SDK_JS_VERSION} ua/2.1 os/${KIRO_CONSTANTS.USER_AGENT_OS} lang/js md/nodejs#${KIRO_CONSTANTS.USER_AGENT_NODE_VERSION} api/codewhispererstreaming#${KIRO_CONSTANTS.AWS_SDK_JS_VERSION} m/E KiroIDE-${KIRO_CONSTANTS.KIRO_VERSION}-${machineId}`;
+}
+
+function buildKiroAmzUserAgent(machineId) {
+    return `aws-sdk-js/${KIRO_CONSTANTS.AWS_SDK_JS_VERSION} KiroIDE-${KIRO_CONSTANTS.KIRO_VERSION}-${machineId}`;
+}
+
+function getHostHeader(url) {
+    try {
+        return new URL(url).host;
+    } catch (_error) {
+        return '';
+    }
+}
+
+function buildGenerateAssistantHeaders(requestUrl, token, machineId) {
+    return {
+        'Host': getHostHeader(requestUrl),
+        'Accept': KIRO_CONSTANTS.ACCEPT_JSON,
+        'Accept-Encoding': KIRO_CONSTANTS.ACCEPT_ENCODING,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': KIRO_CONSTANTS.CONTENT_TYPE_JSON,
+        'x-amz-target': KIRO_CONSTANTS.GENERATE_ASSISTANT_TARGET,
+        'User-Agent': buildKiroUserAgent(machineId),
+        'x-amz-user-agent': buildKiroAmzUserAgent(machineId),
+        'x-amzn-codewhisperer-optout': true,
+        'x-amzn-kiro-agent-mode': 'vibe',
+        'amz-sdk-invocation-id': uuidv4(),
+        'amz-sdk-request': 'attempt=1; max=3',
+        'Connection': 'close'
+    };
+}
+
+function serializeKiroRequestData(requestData) {
+    return JSON.stringify(requestData).replace(/[\u007f-\uffff]/g, (char) => {
+        return `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`;
+    });
+}
+
+function buildKiroEndpointUrl(baseUrl, endpointName) {
+    const normalizedBaseUrl = String(baseUrl || '').trim().replace(/\/+$/, '');
+    if (!normalizedBaseUrl) {
+        return '';
+    }
+
+    const knownEndpoints = new Set([
+        'generateAssistantResponse',
+        'getUsageLimits',
+        'ListAvailableModels'
+    ]);
+
+    try {
+        const url = new URL(normalizedBaseUrl);
+        const pathParts = url.pathname.split('/').filter(Boolean);
+        const currentEndpoint = pathParts[pathParts.length - 1];
+        if (knownEndpoints.has(currentEndpoint)) {
+            pathParts[pathParts.length - 1] = endpointName;
+        } else {
+            pathParts.push(endpointName);
+        }
+        url.pathname = `/${pathParts.join('/')}`;
+        url.search = '';
+        url.hash = '';
+        return url.toString();
+    } catch (error) {
+        const pathParts = normalizedBaseUrl.split('/').filter(Boolean);
+        const currentEndpoint = pathParts[pathParts.length - 1];
+        if (knownEndpoints.has(currentEndpoint)) {
+            pathParts[pathParts.length - 1] = endpointName;
+            return pathParts.join('/');
+        }
+        return `${normalizedBaseUrl}/${endpointName}`;
+    }
 }
 
 // Helper functions for tool calls and JSON parsing
@@ -587,34 +705,19 @@ export class KiroApiService {
         // 仅执行基础的凭证加载
         await this.loadCredentials();
         
-        // 根据当前加载的凭证生成唯一的 Machine ID
-        const machineId = generateMachineIdFromConfig({
-            uuid: this.uuid,
-            profileArn: this.profileArn,
-            clientId: this.clientId
-        });
-        const kiroVersion = KIRO_CONSTANTS.KIRO_VERSION;
-        const { osName, nodeVersion } = getSystemRuntimeInfo();
-
         const axiosConfig = {
             timeout: KIRO_CONSTANTS.AXIOS_TIMEOUT,
-            headers: {
-                'Content-Type': KIRO_CONSTANTS.CONTENT_TYPE_JSON,
-                'Accept': KIRO_CONSTANTS.ACCEPT_JSON,
-                'amz-sdk-invocation-id': uuidv4(),
-                'amz-sdk-request': 'attempt=1; max=3',
-                'x-amzn-codewhisperer-optout': true,
-                'x-amzn-kiro-agent-mode': 'vibe',
-                'x-amz-user-agent': `aws-sdk-js/1.0.34 KiroIDE-${kiroVersion}-${machineId}`,
-                'user-agent': `aws-sdk-js/1.0.34 ua/2.1 os/${osName} lang/js md/nodejs#${nodeVersion} api/codewhispererstreaming#1.0.34 m/E KiroIDE-${kiroVersion}-${machineId}`,
-                'Connection': 'close'
-            },
         };
         
         this.axiosInstance = axios.create(axiosConfig);
+        if (this.axiosInstance?.defaults?.headers) {
+            this.axiosInstance.defaults.headers.common = {};
+            this.axiosInstance.defaults.headers.post = {};
+            this.axiosInstance.defaults.headers.get = {};
+        }
 
         axiosConfig.headers = new Headers();
-        axiosConfig.headers.set('Content-Type', KIRO_CONSTANTS.CONTENT_TYPE_JSON);
+        axiosConfig.headers.set('Content-Type', KIRO_CONSTANTS.REFRESH_CONTENT_TYPE_JSON);
         this.axiosSocialRefreshInstance = axios.create(axiosConfig);
         this.isInitialized = true;
     }
@@ -978,6 +1081,56 @@ async saveCredentialsToFile(filePath, newData) {
         return sanitized;
     }
 
+    _toolUsePartToText(part, toolNameMaps = null) {
+        const name = toolNameMaps?.toKiroName ? toolNameMaps.toKiroName(part?.name || 'unknown') : (part?.name || 'unknown');
+        const toolUseId = part?.id || '';
+        const input = this._sanitizeToolInput(part?.input || {});
+        const inputText = normalizeKiroToolInput(input || {});
+
+        return toolUseId
+            ? `[Tool: ${name} (${toolUseId})]\n${inputText}`
+            : `[Tool: ${name}]\n${inputText}`;
+    }
+
+    _toolResultPartToText(part) {
+        const toolUseId = part?.tool_use_id || '';
+        const contentText = this.getContentText(part?.content) || '(empty result)';
+
+        return toolUseId
+            ? `[Tool Result (${toolUseId})]\n${contentText}`
+            : `[Tool Result]\n${contentText}`;
+    }
+
+    _openAIToolCallToKiroToolUse(toolCall, toolNameMaps = null) {
+        const func = toolCall?.function || {};
+        let input = {};
+        if (typeof func.arguments === 'string' && func.arguments) {
+            try {
+                input = JSON.parse(func.arguments);
+            } catch (error) {
+                input = func.arguments;
+            }
+        } else if (func.arguments && typeof func.arguments === 'object') {
+            input = func.arguments;
+        }
+
+        const rawName = func.name || '';
+        return {
+            input: this._sanitizeToolInput(input),
+            name: toolNameMaps?.toKiroName ? toolNameMaps.toKiroName(rawName) : rawName,
+            toolUseId: toolCall?.id || ''
+        };
+    }
+
+    _openAIToolCallToText(toolCall, toolNameMaps = null) {
+        const toolUse = this._openAIToolCallToKiroToolUse(toolCall, toolNameMaps);
+        const inputText = normalizeKiroToolInput(toolUse.input || {});
+
+        return toolUse.toolUseId
+            ? `[Tool: ${toolUse.name || 'unknown'} (${toolUse.toolUseId})]\n${inputText}`
+            : `[Tool: ${toolUse.name || 'unknown'}]\n${inputText}`;
+    }
+
     /**
      * 统一处理内容，将不同格式的内容转换为文本
      * @param {any} content - 内容对象或数组
@@ -1019,6 +1172,22 @@ async saveCredentialsToFile(filePath, newData) {
     _hasThinkingPrefix(text) {
         if (!text) return false;
         return text.includes(KIRO_THINKING.MODE_TAG) || text.includes(KIRO_THINKING.MAX_LEN_TAG) || text.includes(KIRO_THINKING.EFFORT_TAG);
+    }
+
+    _generateDefaultThinkingInstructionPrefix() {
+        return [
+            '<thinking_mode>enabled</thinking_mode>',
+            `<max_thinking_length>${KIRO_THINKING.DEFAULT_REQUEST_BUDGET_TOKENS}</max_thinking_length>`,
+            `<thinking_instruction>${KIRO_DEFAULT_THINKING_INSTRUCTION}</thinking_instruction>`
+        ].join('\n');
+    }
+
+    _withDefaultThinkingInstruction(content) {
+        const text = content || KIRO_EMPTY_PLACEHOLDER;
+        if (this._hasThinkingPrefix(text)) {
+            return text;
+        }
+        return `${this._generateDefaultThinkingInstructionPrefix()}\n\n${text}`;
     }
 
     _toClaudeContentBlocksFromKiroText(content) {
@@ -1086,10 +1255,38 @@ async saveCredentialsToFile(filePath, newData) {
             systemPrompt = `${builtInPrefix}`;
         }
         
-        const processedMessages = messages.map(message => ({
-            ...message,
-            content: Array.isArray(message.content) ? [...message.content] : message.content
-        }));
+        const messageSystemPrompts = [];
+        const processedMessages = [];
+        for (const message of messages) {
+            if (message.role === 'system') {
+                const content = this.getContentText(message);
+                if (content) {
+                    messageSystemPrompts.push(content);
+                }
+                continue;
+            }
+
+            if (message.role === 'tool') {
+                processedMessages.push({
+                    role: 'user',
+                    content: [{
+                        type: 'tool_result',
+                        tool_use_id: message.tool_call_id || '',
+                        content: message.content
+                    }]
+                });
+                continue;
+            }
+
+            processedMessages.push({
+                ...message,
+                content: Array.isArray(message.content) ? [...message.content] : message.content
+            });
+        }
+
+        if (messageSystemPrompts.length > 0) {
+            systemPrompt = `${systemPrompt}\n\n${messageSystemPrompts.join('\n\n')}`;
+        }
 
         if (processedMessages.length === 0) {
             throw new Error('No user messages found');
@@ -1158,105 +1355,51 @@ async saveCredentialsToFile(filePath, newData) {
         if (tools && Array.isArray(tools) && tools.length > 0) {
             // 过滤掉 web_search 或 websearch 工具（忽略大小写）
             const filteredTools = tools.filter(tool => {
-                const name = (tool.name || '').toLowerCase();
+                const name = (getKiroToolName(tool) || '').toLowerCase();
                 const shouldIgnore = name === 'web_search' || name === 'websearch';
                 if (shouldIgnore) {
-                    logger.info(`[Kiro] Ignoring tool: ${tool.name}`);
+                    logger.info(`[Kiro] Ignoring tool: ${getKiroToolName(tool)}`);
                 }
                 return !shouldIgnore;
             });
             
-            if (filteredTools.length === 0) {
-                // 所有工具都被过滤掉了，添加一个占位工具
-                logger.info('[Kiro] All tools were filtered out, adding placeholder tool');
-                const placeholderTool = {
-                    toolSpecification: {
-                        name: "no_tool_available",
-                        description: "This is a placeholder tool when no other tools are available. It does nothing.",
-                        inputSchema: {
-                            json: {
-                                type: "object",
-                                properties: {}
-                            }
-                        }
-                    }
-                };
-                toolsContext = { tools: [placeholderTool] };
-            } else {
+            if (filteredTools.length > 0) {
                 const MAX_DESCRIPTION_LENGTH = 9216;
 
                 let truncatedCount = 0;
-                const kiroTools = filteredTools
-                    .filter(tool => {
-                        // 过滤掉描述为空的工具
-                        if (!tool.description || tool.description.trim() === '') {
-                            logger.info(`[Kiro] Ignoring tool with empty description: ${tool.name}`);
-                            return false;
-                        }
-                        return true;
-                    })
-                    .map(tool => {
-                        let desc = tool.description || "";
-                        const originalLength = desc.length;
-                        
-                        if (desc.length > MAX_DESCRIPTION_LENGTH) {
-                            desc = desc.substring(0, MAX_DESCRIPTION_LENGTH) + "...";
-                            truncatedCount++;
-                            logger.info(`[Kiro] Truncated tool '${tool.name}' description: ${originalLength} -> ${desc.length} chars`);
-                        }
-                        
-                        return {
-                            toolSpecification: {
-                                name: toolNameMaps.toKiroName(tool.name),
-                                description: desc,
-                                inputSchema: {
-                                    json: tool.input_schema || {}
-                                }
+                const kiroTools = filteredTools.map(tool => {
+                    const toolName = getKiroToolName(tool);
+                    let desc = getKiroToolDescription(tool);
+                    if (!desc.trim()) {
+                        desc = `Tool: ${toolName}`;
+                    }
+                    const originalLength = desc.length;
+                    
+                    if (desc.length > MAX_DESCRIPTION_LENGTH) {
+                        desc = desc.substring(0, MAX_DESCRIPTION_LENGTH) + "...";
+                        truncatedCount++;
+                        logger.info(`[Kiro] Truncated tool '${toolName}' description: ${originalLength} -> ${desc.length} chars`);
+                    }
+                    
+                    return {
+                        toolSpecification: {
+                            name: toolNameMaps.toKiroName(toolName),
+                            description: desc,
+                            inputSchema: {
+                                json: getKiroToolInputSchema(tool)
                             }
-                        };
-                    });
+                        }
+                    };
+                });
                 
                 if (truncatedCount > 0) {
                     logger.info(`[Kiro] Truncated ${truncatedCount} tool description(s) to max ${MAX_DESCRIPTION_LENGTH} chars`);
                 }
 
-                // 检查过滤后是否还有有效工具
-                if (kiroTools.length === 0) {
-                    logger.info('[Kiro] All tools were filtered out (empty descriptions), adding placeholder tool');
-                    const placeholderTool = {
-                        toolSpecification: {
-                            name: "no_tool_available",
-                            description: "This is a placeholder tool when no other tools are available. It does nothing.",
-                            inputSchema: {
-                                json: {
-                                    type: "object",
-                                    properties: {}
-                                }
-                            }
-                        }
-                    };
-                    toolsContext = { tools: [placeholderTool] };
-                } else {
-                    toolsContext = { tools: kiroTools };
-                }
+                toolsContext = { tools: kiroTools };
             }
-        } else {
-            // tools 为空或长度为 0 时，自动添加一个占位工具
-            logger.info('[Kiro] No tools provided, adding placeholder tool');
-            const placeholderTool = {
-                toolSpecification: {
-                    name: "no_tool_available",
-                    description: "This is a placeholder tool when no other tools are available. It does nothing.",
-                    inputSchema: {
-                        json: {
-                            type: "object",
-                            properties: {}
-                        }
-                    }
-                }
-            };
-            toolsContext = { tools: [placeholderTool] };
         }
+        const hasStructuredTools = Array.isArray(toolsContext.tools) && toolsContext.tools.length > 0;
 
         const history = [];
         let startIndex = 0;
@@ -1325,11 +1468,15 @@ async saveCredentialsToFile(filePath, newData) {
                         if (part.type === 'text') {
                             userInputMessage.content += part.text;
                         } else if (part.type === 'tool_result') {
-                            toolResults.push({
-                                content: [{ text: this.getContentText(part.content) }],
-                                status: 'success',
-                                toolUseId: part.tool_use_id
-                            });
+                            if (hasStructuredTools) {
+                                toolResults.push({
+                                    content: [{ text: this.getContentText(part.content) || '(empty result)' }],
+                                    status: 'success',
+                                    toolUseId: part.tool_use_id
+                                });
+                            } else {
+                                userInputMessage.content += `${userInputMessage.content ? '\n\n' : ''}${this._toolResultPartToText(part)}`;
+                            }
                         } else if (part.type === 'image') {
                             if (shouldKeepImages) {
                                 // 最近 5 条消息内的图片保留原始数据
@@ -1392,15 +1539,29 @@ async saveCredentialsToFile(filePath, newData) {
                         } else if (part.type === 'thinking') {
                             thinkingText += (part.thinking ?? part.text ?? '');
                         } else if (part.type === 'tool_use') {
-                            toolUses.push({
-                                input: this._sanitizeToolInput(part.input),
-                                name: toolNameMaps.toKiroName(part.name),
-                                toolUseId: part.id
-                            });
+                            if (hasStructuredTools) {
+                                toolUses.push({
+                                    input: this._sanitizeToolInput(part.input),
+                                    name: toolNameMaps.toKiroName(part.name),
+                                    toolUseId: part.id
+                                });
+                            } else {
+                                assistantResponseMessage.content += `${assistantResponseMessage.content ? '\n\n' : ''}${this._toolUsePartToText(part, toolNameMaps)}`;
+                            }
                         }
                     }
                 } else {
                     assistantResponseMessage.content = this.getContentText(message);
+                }
+
+                if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+                    for (const toolCall of message.tool_calls) {
+                        if (hasStructuredTools) {
+                            toolUses.push(this._openAIToolCallToKiroToolUse(toolCall, toolNameMaps));
+                        } else {
+                            assistantResponseMessage.content += `${assistantResponseMessage.content ? '\n\n' : ''}${this._openAIToolCallToText(toolCall, toolNameMaps)}`;
+                        }
+                    }
                 }
 
                 if (thinkingText) {
@@ -1443,15 +1604,28 @@ async saveCredentialsToFile(filePath, newData) {
                     } else if (part.type === 'thinking') {
                         thinkingText += (part.thinking ?? part.text ?? '');
                     } else if (part.type === 'tool_use') {
-                        assistantResponseMessage.toolUses.push({
-                            input: this._sanitizeToolInput(part.input),
-                            name: toolNameMaps.toKiroName(part.name),
-                            toolUseId: part.id
-                        });
+                        if (hasStructuredTools) {
+                            assistantResponseMessage.toolUses.push({
+                                input: this._sanitizeToolInput(part.input),
+                                name: toolNameMaps.toKiroName(part.name),
+                                toolUseId: part.id
+                            });
+                        } else {
+                            assistantResponseMessage.content += `${assistantResponseMessage.content ? '\n\n' : ''}${this._toolUsePartToText(part, toolNameMaps)}`;
+                        }
                     }
                 }
             } else {
                 assistantResponseMessage.content = this.getContentText(currentMessage);
+            }
+            if (Array.isArray(currentMessage.tool_calls) && currentMessage.tool_calls.length > 0) {
+                for (const toolCall of currentMessage.tool_calls) {
+                    if (hasStructuredTools) {
+                        assistantResponseMessage.toolUses.push(this._openAIToolCallToKiroToolUse(toolCall, toolNameMaps));
+                    } else {
+                        assistantResponseMessage.content += `${assistantResponseMessage.content ? '\n\n' : ''}${this._openAIToolCallToText(toolCall, toolNameMaps)}`;
+                    }
+                }
             }
             if (thinkingText) {
                 assistantResponseMessage.content = assistantResponseMessage.content
@@ -1463,8 +1637,8 @@ async saveCredentialsToFile(filePath, newData) {
             }
             history.push({ assistantResponseMessage });
             
-            // 设置 currentContent 为 "Continue"，因为我们需要一个 user 消息来触发 AI 继续
-            currentContent = 'Continue';
+            // 设置占位 user 消息来触发 AI 继续
+            currentContent = KIRO_EMPTY_PLACEHOLDER;
         } else {
             // 最后一条消息是 user，需要确保 history 最后一个元素是 assistantResponseMessage
             // Kiro API 要求 history 必须以 assistantResponseMessage 结尾
@@ -1475,7 +1649,7 @@ async saveCredentialsToFile(filePath, newData) {
                     logger.info('[Kiro] History does not end with assistantResponseMessage, adding empty one');
                     history.push({
                         assistantResponseMessage: {
-                            content: 'Continue'
+                            content: KIRO_EMPTY_PLACEHOLDER
                         }
                     });
                 }
@@ -1484,21 +1658,29 @@ async saveCredentialsToFile(filePath, newData) {
             // 处理 user 消息
             if (Array.isArray(currentMessage.content)) {
                 for (const part of currentMessage.content) {
-                    if (part.type === 'text') {
-                        currentContent += part.text;
-                    } else if (part.type === 'tool_result') {
-                        currentToolResults.push({
-                            content: [{ text: this.getContentText(part.content) }],
-                            status: 'success',
-                            toolUseId: part.tool_use_id
-                        });
-                    } else if (part.type === 'tool_use') {
-                        currentToolUses.push({
-                            input: this._sanitizeToolInput(part.input),
-                            name: toolNameMaps.toKiroName(part.name),
-                            toolUseId: part.id
-                        });
-                    } else if (part.type === 'image') {
+                        if (part.type === 'text') {
+                            currentContent += part.text;
+                        } else if (part.type === 'tool_result') {
+                            if (hasStructuredTools) {
+                                currentToolResults.push({
+                                    content: [{ text: this.getContentText(part.content) || '(empty result)' }],
+                                    status: 'success',
+                                    toolUseId: part.tool_use_id
+                                });
+                            } else {
+                                currentContent += `${currentContent ? '\n\n' : ''}${this._toolResultPartToText(part)}`;
+                            }
+                        } else if (part.type === 'tool_use') {
+                            if (hasStructuredTools) {
+                                currentToolUses.push({
+                                    input: this._sanitizeToolInput(part.input),
+                                    name: toolNameMaps.toKiroName(part.name),
+                                    toolUseId: part.id
+                                });
+                            } else {
+                                currentContent += `${currentContent ? '\n\n' : ''}${this._toolUsePartToText(part, toolNameMaps)}`;
+                            }
+                        } else if (part.type === 'image') {
                         currentImages.push({
                             format: part.source.media_type.split('/')[1],
                             source: {
@@ -1513,7 +1695,7 @@ async saveCredentialsToFile(filePath, newData) {
 
             // Kiro API 要求 content 不能为空，即使有 toolResults
             if (!currentContent) {
-                currentContent = currentToolResults.length > 0 ? 'Tool results provided.' : 'Continue';
+                currentContent = KIRO_EMPTY_PLACEHOLDER;
             }
 
             if (prependSystemToCurrentMessage) {
@@ -1525,7 +1707,6 @@ async saveCredentialsToFile(filePath, newData) {
 
         const request = {
             conversationState: {
-                agentTaskType: "vibe",
                 chatTriggerType: KIRO_CONSTANTS.CHAT_TRIGGER_TYPE_MANUAL,
                 conversationId: conversationId,
                 currentMessage: {} // Will be populated as userInputMessage
@@ -1540,7 +1721,7 @@ async saveCredentialsToFile(filePath, newData) {
         // currentMessage 始终是 userInputMessage 类型
         // 注意：API 不接受 null 值，空字段应该完全不包含
         const userInputMessage = {
-            content: currentContent,
+            content: this._withDefaultThinkingInstruction(currentContent),
             modelId: codewhispererModel,
             origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
         };
@@ -1575,7 +1756,7 @@ async saveCredentialsToFile(filePath, newData) {
 
         request.conversationState.currentMessage.userInputMessage = userInputMessage;
 
-        if (this.authMethod === KIRO_CONSTANTS.AUTH_METHOD_SOCIAL) {
+        if (this.profileArn) {
             request.profileArn = this.profileArn;
         }
 
@@ -1725,17 +1906,15 @@ async saveCredentialsToFile(filePath, newData) {
 
         try {
             const token = this.accessToken; // Use the already initialized token
-            const headers = {
-                'Authorization': `Bearer ${token}`,
-                'amz-sdk-invocation-id': `${uuidv4()}`,
-            };
 
             // 当 model 以 kiro-amazonq 开头时，使用 amazonQUrl，否则使用 baseUrl
-            const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
+            const requestBaseUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
+            const requestUrl = buildKiroEndpointUrl(requestBaseUrl, 'generateAssistantResponse');
+            const headers = buildGenerateAssistantHeaders(requestUrl, token, getKiroRuntimeMachineId(this));
             const axiosConfig = {
                 method: 'post',
                 url: requestUrl,
-                data: requestData,
+                data: serializeKiroRequestData(requestData),
                 headers
             };
             this._applySidecar(axiosConfig);
@@ -2155,12 +2334,23 @@ async saveCredentialsToFile(filePath, newData) {
         const events = [];
         let remaining = buffer;
         let searchStart = 0;
+        const looksLikeJsonObjectStart = (text, index) => {
+            let nextIndex = index + 1;
+            while (nextIndex < text.length && /\s/.test(text[nextIndex])) {
+                nextIndex++;
+            }
+            return nextIndex >= text.length || text[nextIndex] === '"' || text[nextIndex] === '}';
+        };
         
         while (true) {
             // 查找真正的 JSON payload 起始位置。AWS Event Stream 包含二进制头部，
             // payload 对象里的 key 顺序不稳定，所以不能依赖 {"input": 这类固定开头。
             const jsonStart = remaining.indexOf('{', searchStart);
             if (jsonStart < 0) break;
+            if (!looksLikeJsonObjectStart(remaining, jsonStart)) {
+                searchStart = jsonStart + 1;
+                continue;
+            }
             
             // 正确处理嵌套的 {} - 使用括号计数法
             let braceCount = 0;
@@ -2302,13 +2492,10 @@ async saveCredentialsToFile(filePath, newData) {
         const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking);
         const toolNameMaps = requestData._kiroToolNameMaps;
 
+        const requestBaseUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
+        const requestUrl = buildKiroEndpointUrl(requestBaseUrl, 'generateAssistantResponse');
         const token = this.accessToken;
-        const headers = {
-            'Authorization': `Bearer ${token}`,
-            'amz-sdk-invocation-id': `${uuidv4()}`,
-        };
-
-        const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
+        const headers = buildGenerateAssistantHeaders(requestUrl, token, getKiroRuntimeMachineId(this));
 
         let stream = null;
         let releaseThrottle = () => {};
@@ -2316,7 +2503,7 @@ async saveCredentialsToFile(filePath, newData) {
             const axiosConfig = {
                 method: 'post',
                 url: requestUrl,
-                data: requestData,
+                data: serializeKiroRequestData(requestData),
                 headers,
                 responseType: 'stream'
             };
@@ -3310,14 +3497,13 @@ async saveCredentialsToFile(filePath, newData) {
         const resourceType = 'AGENTIC_REQUEST';
         
         // 构建请求 URL
-        let usageLimitsUrl = this.baseUrl;
-        usageLimitsUrl = usageLimitsUrl.replace('generateAssistantResponse', 'getUsageLimits');
+        const usageLimitsUrl = buildKiroEndpointUrl(this.baseUrl, 'getUsageLimits');
         const params = new URLSearchParams({
             isEmailRequired: 'true',
             origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR,
             resourceType: resourceType
         });
-         if (this.authMethod === KIRO_CONSTANTS.AUTH_METHOD_SOCIAL && this.profileArn) {
+        if (this.profileArn) {
             params.append('profileArn', this.profileArn);
         }
         const fullUrl = `${usageLimitsUrl}?${params.toString()}`;
